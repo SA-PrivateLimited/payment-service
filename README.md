@@ -1,262 +1,162 @@
-# Razorpay Payment Server
+# Payment Service - Multi-App Payment Gateway
 
-A reusable, secure Razorpay payment server that can be used by multiple applications. All sensitive payment operations (order creation, signature verification) are handled server-side for maximum security.
+A reusable Razorpay payment server that supports multiple applications with app-specific configurations.
 
-## Features
+## 🎯 Current Status
 
-- ✅ **Secure Order Creation** - Orders are created server-side using Razorpay API
-- ✅ **Payment Verification** - Server-side signature verification prevents fraud
-- ✅ **UPI QR Code Generation** - Generate UPI payment links for QR codes
-- ✅ **Webhook Support** - Handle Razorpay webhooks for payment status updates
-- ✅ **Multi-App Ready** - Can be used by multiple applications
-- ✅ **CORS Configuration** - Configurable CORS for security
-- ✅ **Error Handling** - Comprehensive error handling and logging
+**✅ Configured for MediFind** - Ready to use immediately  
+**✅ Multi-app ready** - Other apps can be added later
 
-## Quick Start
+## 🚀 Quick Start
 
-### 1. Installation
+### 1. Install Dependencies
 
 ```bash
-cd payment-service
 npm install
 ```
 
-### 2. Configuration
+### 2. Configure Environment
 
-Copy the example environment file and configure it:
-
-```bash
-cp env.example .env
-```
-
-Edit `.env` and add your Razorpay credentials:
+Copy `.env.example` to `.env` and fill in:
 
 ```env
-RAZORPAY_KEY_ID=rzp_test_xxxxxxxxxxxxx
-RAZORPAY_KEY_SECRET=your_key_secret_here
-MERCHANT_NAME=YourAppName
-MERCHANT_UPI_ID=yourbusiness@paytm
+# Razorpay
+RAZORPAY_KEY_ID=rzp_test_xxxxx
+RAZORPAY_KEY_SECRET=your_secret_key
+
+# Firebase (for payment-service)
+FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json
+
+# OneSignal (for MediFind notifications)
+ONESIGNAL_REST_API_KEY=your_onesignal_rest_api_key
+
+# Server
+PORT=3001
 ```
 
-### 3. Run Server
+### 3. Start Server
 
-**Development:**
-```bash
-npm run dev
-```
-
-**Production:**
 ```bash
 npm start
 ```
 
-The server will start on `http://localhost:3001` (or the port specified in `.env`).
+## 📋 Features
 
-## API Endpoints
+- ✅ **Payment Order Creation** - Create Razorpay orders
+- ✅ **Payment Verification** - Verify payment signatures
+- ✅ **QR Code Generation** - Generate UPI QR codes
+- ✅ **Webhook Handling** - Handle Razorpay webhooks
+- ✅ **Multi-App Support** - Configure different apps
+- ✅ **Notifications** - Send notifications (OneSignal, custom endpoints)
+- ✅ **Firebase Integration** - Update orders/consultations
+- ✅ **Test Mode** - Handle test payments gracefully
 
-### Health Check
+## 🏗️ Architecture
+
 ```
-GET /health
+payment-service/
+├── server.js                 # Main server
+├── config/
+│   ├── apps.example.js      # Example configurations
+│   └── apps.js              # Your app configs (MediFind configured)
+├── src/
+│   ├── app-config/          # App configuration manager
+│   ├── notifications/       # Notification service
+│   └── order-update/        # Order update service
+└── ...
 ```
-Returns server status and version.
+
+## 📖 Documentation
+
+- **[MEDIFIND_SETUP.md](./MEDIFIND_SETUP.md)** - MediFind-specific setup guide
+- **[MULTI_APP_SETUP.md](./MULTI_APP_SETUP.md)** - Multi-app configuration guide
+- **[README_MULTI_APP.md](./README_MULTI_APP.md)** - Complete multi-app documentation
+
+## 🔧 MediFind Integration
+
+MediFind is configured as the default app. No app ID needed!
 
 ### Create Order
-```
+
+```javascript
 POST /api/payment/create-order
 Content-Type: application/json
 
-Body:
 {
-  "amount": 50000,        // Amount in paise (₹500 = 50000)
-  "currency": "INR",      // Optional, defaults to INR
-  "receipt": "order_123", // Optional
-  "notes": {              // Optional metadata
-    "consultationId": "123",
-    "appName": "MediFind"
-  }
-}
-
-Response:
-{
-  "success": true,
-  "order": {
-    "id": "order_xxx",
     "amount": 50000,
     "currency": "INR",
-    "status": "created"
+  "notes": {
+    "consultationId": "consultation123"
   }
 }
 ```
 
 ### Verify Payment
-```
+
+```javascript
 POST /api/payment/verify
 Content-Type: application/json
 
-Body:
 {
   "razorpay_order_id": "order_xxx",
   "razorpay_payment_id": "pay_xxx",
-  "razorpay_signature": "signature_xxx"
-}
-
-Response:
-{
-  "success": true,
-  "message": "Payment verified successfully",
-  "payment_id": "pay_xxx",
-  "order_id": "order_xxx"
+  "razorpay_signature": "signature_xxx",
+  "consultationId": "consultation123",
+  "amount": 50000
 }
 ```
 
-### Generate UPI Link
-```
-POST /api/payment/generate-upi-link
-Content-Type: application/json
+## 🔔 Notifications
 
-Body:
-{
-  "amount": 50000,                    // Amount in paise
-  "upiId": "merchant@paytm",          // Optional, uses env var if not provided
-  "description": "Payment for order", // Optional
-  "merchantName": "AppName"           // Optional, uses env var if not provided
-}
+When payment succeeds or fails, notifications are sent to:
+- Patient (`consultation.patientId`)
+- Doctor (`consultation.doctorId`)
+- Admins (all users with `role: 'admin'`)
 
-Response:
-{
-  "success": true,
-  "upiLink": "upi://pay?pa=...",
-  "transactionId": "TXNxxx",
-  "amount": 50000,
-  "amountInRupees": 500
-}
-```
+## 🧪 Test Mode
 
-### Webhook Handler
-```
-POST /api/payment/webhook
-Content-Type: application/json
-X-Razorpay-Signature: signature
+- Auto-detects test mode from Razorpay keys (`rzp_test_*`)
+- Books consultations even if payment fails
+- Sends notifications about payment status
 
-Body: (Razorpay webhook payload)
+## ➕ Adding Other Apps Later
 
-Response:
-{
-  "received": true
-}
-```
+1. Edit `config/apps.js`
+2. Add new app configuration
+3. Use app ID in requests (header, query, or notes)
 
-## Integration with Client Apps
+**MediFind continues working** - no changes needed!
 
-### React Native Example
+## 📝 API Endpoints
 
-Update your client-side payment service:
+- `POST /api/payment/create-order` - Create payment order
+- `POST /api/payment/verify` - Verify payment signature
+- `POST /api/payment/qr-code` - Generate QR code
+- `GET /api/payment/qr-code/:qrCodeId` - Get QR code details
+- `POST /api/payment/webhook` - Razorpay webhook handler
+- `GET /health` - Health check
 
-```typescript
-const API_BASE_URL = 'http://your-server.com';
+## 🔒 Security
 
-// Create order
-const createOrder = async (amount: number) => {
-  const response = await fetch(`${API_BASE_URL}/api/payment/create-order`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ amount }),
-  });
-  return response.json();
-};
+- Payment signature verification
+- Webhook signature verification
+- CORS configuration
+- Environment variable protection
 
-// Verify payment
-const verifyPayment = async (orderId: string, paymentId: string, signature: string) => {
-  const response = await fetch(`${API_BASE_URL}/api/payment/verify`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      razorpay_order_id: orderId,
-      razorpay_payment_id: paymentId,
-      razorpay_signature: signature,
-    }),
-  });
-  return response.json();
-};
-```
+## 📦 Deployment
 
-## Deployment
+Deploy to:
+- Railway.app
+- Render.com
+- Fly.io
+- Heroku
+- DigitalOcean App Platform
+- AWS Elastic Beanstalk
 
-### Railway.app
-
-1. Connect your GitHub repository
-2. Select the `payment-service` directory as root
-3. Set environment variables in Railway dashboard
-4. Deploy!
-
-### Render.com
-
-1. Create new Web Service
-2. Connect repository and set root directory to `payment-service`
-3. Build command: `npm install`
-4. Start command: `npm start`
-5. Set environment variables
-6. Deploy!
-
-### Fly.io
-
-```bash
-cd payment-service
-fly launch
-# Follow prompts and set environment variables
-fly deploy
-```
-
-### Heroku
-
-```bash
-cd payment-service
-heroku create your-app-name
-heroku config:set RAZORPAY_KEY_ID=xxx
-heroku config:set RAZORPAY_KEY_SECRET=xxx
-git push heroku main
-```
-
-## Security Best Practices
-
-1. **Never expose Key Secret** - Keep `RAZORPAY_KEY_SECRET` only on server
-2. **Use HTTPS** - Always use HTTPS in production
-3. **Verify Signatures** - Always verify payment signatures server-side
-4. **Configure CORS** - Set `ALLOWED_ORIGINS` in production
-5. **Enable Webhooks** - Use webhooks for payment status updates
-6. **Log Security Events** - Monitor logs for suspicious activity
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RAZORPAY_KEY_ID` | Yes | Your Razorpay Key ID |
-| `RAZORPAY_KEY_SECRET` | Yes | Your Razorpay Key Secret |
-| `MERCHANT_NAME` | No | Merchant name for UPI links |
-| `MERCHANT_UPI_ID` | No | Merchant UPI ID for UPI links |
-| `RAZORPAY_WEBHOOK_SECRET` | No | Webhook secret for signature verification |
-| `PORT` | No | Server port (default: 3001) |
-| `NODE_ENV` | No | Environment (development/production) |
-| `ALLOWED_ORIGINS` | No | Comma-separated list of allowed origins |
-
-## Troubleshooting
-
-### Server won't start
-- Check if `.env` file exists and has required variables
-- Verify `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` are correct
-- Check if port 3001 is available
-
-### Payment verification fails
-- Ensure signature is generated correctly on client
-- Verify `RAZORPAY_KEY_SECRET` matches the one used in Razorpay Dashboard
-- Check that order ID and payment ID are correct
-
-### CORS errors
-- Add your client app URL to `ALLOWED_ORIGINS` in `.env`
-- For development, you can temporarily set `ALLOWED_ORIGINS=*` (not recommended for production)
-
-## License
+## 📄 License
 
 MIT
 
-# payment-service
+---
+
+**MediFind is configured and ready to use!** 🎉

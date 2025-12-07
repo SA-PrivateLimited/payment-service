@@ -27,46 +27,116 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 const path = require('path');
+const https = require('https');
+
+// Load modular services
+const {getAppConfig, mergeWithDefault} = require('./src/app-config');
+const {sendPaymentNotification} = require('./src/notifications');
+const {getOrderDetails, updateOrderPaymentStatus} = require('./src/order-update');
 
 const app = express();
 
+/**
+ * Middleware to extract app ID from request
+ */
+function getAppIdFromRequest(req) {
+  // Priority 1: Header
+  if (req.headers['x-app-id']) {
+    return req.headers['x-app-id'];
+  }
+  
+  // Priority 2: Query parameter
+  if (req.query.appId) {
+    return req.query.appId;
+  }
+  
+  // Priority 3: Request body notes
+  if (req.body?.notes?.appId) {
+    return req.body.notes.appId;
+  }
+  
+  // Priority 4: Request body (for verify endpoint)
+  if (req.body?.appId) {
+    return req.body.appId;
+  }
+  
+  return null;
+}
+
 // Initialize Firebase Admin SDK (optional - only if service account is provided)
-// Using Realtime Database instead of Firestore (no billing required)
+// Supports multiple Firebase projects:
+// 1. Payment-service Firebase (for storing payment records)
+// 2. MediFind Firebase (for updating consultations)
 let database = null;
+let firestore = null;
+
 if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH || process.env.FIREBASE_PROJECT_ID) {
   try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
       // Use service account key file
       const serviceAccountPath = path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
       const serviceAccount = require(serviceAccountPath);
+      
+      // Initialize default app (for payment-service Firebase)
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         databaseURL: `https://${serviceAccount.project_id}-default-rtdb.firebaseio.com/`,
       });
+      
+      // If service account is for MediFind Firebase, also initialize Firestore
+      if (serviceAccount.project_id === 'medifind-doctor') {
+        firestore = admin.firestore();
+        console.log('✅ MediFind Firebase (medifind-doctor) initialized - Firestore enabled');
+      }
+      
+      database = admin.database();
+      console.log('✅ Firebase Admin initialized successfully');
+      console.log(`   Project: ${serviceAccount.project_id}`);
+      console.log(`   Realtime Database: Enabled`);
+      console.log(`   Firestore: ${firestore ? 'Enabled' : 'Disabled'}`);
     } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
       // Use individual credentials from environment variables
+      const projectId = process.env.FIREBASE_PROJECT_ID;
       admin.initializeApp({
         credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
+          projectId: projectId,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
           privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
         }),
-        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/`,
+        databaseURL: process.env.FIREBASE_DATABASE_URL || `https://${projectId}-default-rtdb.firebaseio.com/`,
       });
+      
+      // If project is MediFind, enable Firestore
+      if (projectId === 'medifind-doctor') {
+        firestore = admin.firestore();
+        console.log('✅ MediFind Firebase (medifind-doctor) initialized - Firestore enabled');
+      }
+      
+      database = admin.database();
+      console.log('✅ Firebase Admin initialized successfully');
+      console.log(`   Project: ${projectId}`);
+      console.log(`   Realtime Database: Enabled`);
+      console.log(`   Firestore: ${firestore ? 'Enabled' : 'Disabled'}`);
     }
-    database = admin.database();
-    console.log('✅ Firebase Admin initialized successfully (Realtime Database)');
   } catch (error) {
     console.warn('⚠️  Firebase Admin initialization failed:', error.message);
-    console.warn('⚠️  Payment records will not be saved to Realtime Database. Continuing without Firebase...');
+    console.warn('⚠️  Payment records will not be saved. Continuing without Firebase...');
   }
 } else {
-  console.log('ℹ️  Firebase Admin not configured. Payment records will not be saved to Realtime Database.');
+  console.log('ℹ️  Firebase Admin not configured. Payment records will not be saved.');
 }
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({extended: true}));
+
+// Middleware to attach app config to request
+app.use((req, res, next) => {
+  const appId = getAppIdFromRequest(req);
+  req.appConfig = mergeWithDefault(getAppConfig(appId));
+  req.appId = appId || 'default';
+  next();
+});
 
 // CORS configuration - Allow requests from any origin (configure as needed)
 app.use((req, res, next) => {
@@ -141,6 +211,173 @@ async function savePaymentToDatabase(paymentData) {
   } catch (error) {
     console.error('❌ Error saving payment to Realtime Database:', error);
     // Don't throw - payment verification succeeded, database save is secondary
+  }
+}
+
+/**
+ * Helper function to send OneSignal notification
+ */
+async function sendOneSignalNotification(userIds, title, body, data = {}) {
+  try {
+    const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || 'b0020b77-3e0c-43c5-b92e-912b1cec1623';
+    const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY || 
+      'os_v2_app_wabaw5z6brb4lojosevrz3awemukckhdmqsunhvjcdih2ety74puooxs7oddp6jvdj2wudiztxma4nh2e5bpcoariibnh644xmslyga';
+
+    if (!userIds || userIds.length === 0) {
+      console.log('No user IDs provided for notification');
+      return;
+    }
+
+    const response = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Basic ${ONESIGNAL_REST_API_KEY}`,
+      },
+      body: JSON.stringify({
+        app_id: ONESIGNAL_APP_ID,
+        include_external_user_ids: userIds,
+        headings: {en: title},
+        contents: {en: body},
+        data: data,
+      }),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error('❌ OneSignal API error:', result);
+      return;
+    }
+
+    console.log(`✅ Notification sent to ${result.recipients || 0} recipients`);
+  } catch (error) {
+    console.error('❌ Error sending OneSignal notification:', error);
+    // Don't throw - notifications are non-critical
+  }
+}
+
+/**
+ * Helper function to get consultation details from Firebase
+ */
+async function getConsultationDetails(consultationId) {
+  if (!database) {
+    return null;
+  }
+
+  try {
+    // Try Firestore first (if available)
+    if (admin.firestore) {
+      const firestore = admin.firestore();
+      const consultationDoc = await firestore.collection('consultations').doc(consultationId).get();
+      if (consultationDoc.exists) {
+        return {id: consultationDoc.id, ...consultationDoc.data()};
+      }
+    }
+
+    // Fallback to Realtime Database
+    const consultationSnapshot = await database.ref(`consultations/${consultationId}`).once('value');
+    if (consultationSnapshot.exists()) {
+      return {id: consultationId, ...consultationSnapshot.val()};
+    }
+
+    return null;
+  } catch (error) {
+    console.error('❌ Error fetching consultation:', error);
+    return null;
+  }
+}
+
+/**
+ * Helper function to update consultation payment status
+ * Tries Firestore first (MediFind uses Firestore), then falls back to Realtime Database
+ */
+async function updateConsultationPaymentStatus(consultationId, paymentStatus, paymentId = null) {
+  if (!database) {
+    return;
+  }
+
+  try {
+    const updateData = {
+      paymentStatus: paymentStatus,
+      updatedAt: admin.firestore ? admin.firestore.FieldValue.serverTimestamp() : admin.database.ServerValue.TIMESTAMP,
+    };
+
+    if (paymentId) {
+      updateData.paymentId = paymentId;
+    }
+
+    if (paymentStatus === 'paid') {
+      updateData.paidAt = admin.firestore ? admin.firestore.FieldValue.serverTimestamp() : admin.database.ServerValue.TIMESTAMP;
+    }
+
+    // Try Firestore first (MediFind uses Firestore)
+    try {
+      const firestore = admin.firestore();
+      await firestore.collection('consultations').doc(consultationId).update(updateData);
+      console.log(`✅ Consultation ${consultationId} updated in Firestore (paymentStatus: ${paymentStatus})`);
+      return;
+    } catch (firestoreError) {
+      // Firestore not available or error, try Realtime Database
+      console.log('Firestore update failed, trying Realtime Database');
+    }
+
+    // Fallback to Realtime Database
+    await database.ref(`consultations/${consultationId}`).update(updateData);
+    console.log(`✅ Consultation ${consultationId} updated in Realtime Database (paymentStatus: ${paymentStatus})`);
+  } catch (error) {
+    console.error('❌ Error updating consultation:', error);
+    // Don't throw - payment verification succeeded, consultation update is secondary
+  }
+}
+
+/**
+ * Helper function to send payment notifications (using modular service)
+ */
+async function sendPaymentNotifications(appConfig, consultationId, paymentStatus, amount, paymentId = null) {
+  try {
+    const orderData = await getOrderDetails(appConfig, consultationId);
+    if (!orderData) {
+      console.warn(`⚠️ Order/Consultation ${consultationId} not found, skipping notifications`);
+      return;
+    }
+
+    // Collect user IDs to notify
+    const userIds = [];
+    
+    // Add patient/user ID (support multiple field names)
+    if (orderData.patientId) {
+      userIds.push(orderData.patientId);
+    } else if (orderData.userId) {
+      userIds.push(orderData.userId);
+    } else if (orderData.customerId) {
+      userIds.push(orderData.customerId);
+    }
+
+    // Add doctor/provider ID (support multiple field names)
+    if (orderData.doctorId) {
+      userIds.push(orderData.doctorId);
+    } else if (orderData.providerId) {
+      userIds.push(orderData.providerId);
+    } else if (orderData.sellerId) {
+      userIds.push(orderData.sellerId);
+    }
+
+    // Get admin IDs (if needed - app-specific)
+    // This is optional and can be configured per app
+
+    // Send notification using modular service
+    await sendPaymentNotification(
+      appConfig,
+      consultationId,
+      paymentStatus,
+      amount,
+      paymentId,
+      orderData
+    );
+  } catch (error) {
+    console.error('❌ Error sending payment notifications:', error);
+    // Don't throw - notifications are non-critical
   }
 }
 
@@ -279,7 +516,8 @@ app.post('/api/payment/create-order', async (req, res) => {
  *   razorpay_signature: 'signature',
  *   consultationId: 'consultation_id' (optional),
  *   amount: 50000 (optional - amount in paise),
- *   notes: {} (optional)
+ *   notes: {} (optional),
+ *   isTestMode: true (optional - if true, will book consultation even if payment fails)
  * }
  */
 app.post('/api/payment/verify', async (req, res) => {
@@ -288,6 +526,10 @@ app.post('/api/payment/verify', async (req, res) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
+      consultationId,
+      amount,
+      notes = {},
+      isTestMode = false, // Default to false, set to true for test mode
     } = req.body;
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -306,6 +548,9 @@ app.post('/api/payment/verify', async (req, res) => {
 
     // Verify signature
     const isSignatureValid = generatedSignature === razorpay_signature;
+    const isTestPayment = razorpay_payment_id.startsWith('pay_test_') || 
+                          process.env.RAZORPAY_KEY_ID.startsWith('rzp_test_') || 
+                          isTestMode;
 
     if (isSignatureValid) {
       console.log(`✅ Payment verified successfully: ${razorpay_payment_id}`);
@@ -315,13 +560,24 @@ app.post('/api/payment/verify', async (req, res) => {
         razorpay_payment_id: razorpay_payment_id,
         razorpay_order_id: razorpay_order_id,
         razorpay_signature: razorpay_signature,
-        amount: req.body.amount || null,
-        consultationId: req.body.consultationId || null,
-        notes: req.body.notes || {},
+        amount: amount || null,
+        consultationId: consultationId || null,
+        notes: notes || {},
       };
       savePaymentToDatabase(paymentData).catch(err => {
         console.error('Failed to save payment to Realtime Database:', err);
       });
+
+      // Update order/consultation payment status (using app config)
+      if (consultationId) {
+        const appConfig = req.appConfig;
+        await updateOrderPaymentStatus(appConfig, consultationId, 'paid', razorpay_payment_id);
+        
+        // Send notifications to patient, doctor, and admin (using app config)
+        sendPaymentNotifications(appConfig, consultationId, 'paid', amount, razorpay_payment_id).catch(err => {
+          console.error('Failed to send payment notifications:', err);
+        });
+      }
 
       res.json({
         success: true,
@@ -332,11 +588,36 @@ app.post('/api/payment/verify', async (req, res) => {
       });
     } else {
       console.error(`❌ Payment verification failed: ${razorpay_payment_id}`);
+
+      // In test mode, still book consultation even if payment fails
+      const appConfig = req.appConfig;
+      const shouldBookOnFailure = appConfig.testMode?.bookOnPaymentFailure !== false; // Default true
+      
+      if ((isTestPayment || appConfig.testMode?.autoDetect) && consultationId && shouldBookOnFailure) {
+        console.log(`⚠️ Test mode: Payment failed but booking consultation ${consultationId}`);
+        
+        // Update consultation payment status to 'pending' (using app config)
+        await updateOrderPaymentStatus(appConfig, consultationId, 'pending', null);
+        
+        // Send notifications about payment failure (but consultation still booked)
+        sendPaymentNotifications(appConfig, consultationId, 'failed', amount, razorpay_payment_id).catch(err => {
+          console.error('Failed to send payment failure notifications:', err);
+        });
+
+        res.json({
+          success: false,
+          error: 'Invalid payment signature (test mode)',
+          payment_id: razorpay_payment_id,
+          consultation_booked: true, // Indicate consultation is still booked
+          message: 'Payment verification failed, but consultation has been booked (test mode)',
+        });
+      } else {
       res.status(400).json({
         success: false,
         error: 'Invalid payment signature',
         payment_id: razorpay_payment_id,
       });
+      }
     }
   } catch (error) {
     console.error('❌ Error verifying payment:', error);
@@ -534,6 +815,9 @@ app.post('/api/payment/webhook', express.raw({type: 'application/json'}), async 
         const payment = event.payload.payment.entity;
         console.log(`✅ Payment captured: ${payment.id}, Amount: ₹${payment.amount / 100}`);
         
+        // Get consultation ID from payment notes
+        const consultationId = payment.notes?.consultationId || payment.notes?.consultation_id;
+        
         // Save payment to Realtime Database
         if (database) {
           const paymentData = {
@@ -542,10 +826,19 @@ app.post('/api/payment/webhook', express.raw({type: 'application/json'}), async 
             amount: payment.amount,
             status: 'completed',
             method: payment.method,
+            consultationId: consultationId,
             notes: payment.notes || {},
           };
           savePaymentToDatabase(paymentData).catch(err => {
             console.error('Failed to save webhook payment to Realtime Database:', err);
+          });
+        }
+
+        // Update consultation and send notifications (using app config)
+        if (consultationId) {
+          await updateOrderPaymentStatus(appConfig, consultationId, 'paid', payment.id);
+          sendPaymentNotifications(appConfig, consultationId, 'paid', payment.amount, payment.id).catch(err => {
+            console.error('Failed to send payment success notifications:', err);
           });
         }
         break;
@@ -553,6 +846,14 @@ app.post('/api/payment/webhook', express.raw({type: 'application/json'}), async 
       case 'payment.failed':
         const failedPayment = event.payload.payment.entity;
         console.log(`❌ Payment failed: ${failedPayment.id}`);
+        
+        // Get consultation ID and app ID from payment notes
+        const failedConsultationId = failedPayment.notes?.consultationId || failedPayment.notes?.consultation_id;
+        const appId = failedPayment.notes?.appId || 'default';
+        const appConfig = mergeWithDefault(getAppConfig(appId));
+        const isTestMode = failedPayment.id.startsWith('pay_test_') || 
+                          process.env.RAZORPAY_KEY_ID.startsWith('rzp_test_') ||
+                          appConfig.testMode?.autoDetect;
         
         // Save failed payment to Realtime Database
         if (database) {
@@ -566,11 +867,29 @@ app.post('/api/payment/webhook', express.raw({type: 'application/json'}), async 
               status: 'failed',
               errorCode: failedPayment.error_code,
               errorDescription: failedPayment.error_description,
+              consultationId: failedConsultationId,
               createdAt: admin.database.ServerValue.TIMESTAMP,
             });
           } catch (error) {
             console.error('Failed to save failed payment to Realtime Database:', error);
           }
+        }
+
+        // In test mode, still book consultation even if payment fails
+        if (failedConsultationId) {
+          const shouldBookOnFailure = appConfig.testMode?.bookOnPaymentFailure !== false; // Default true
+          
+          if (isTestMode && shouldBookOnFailure) {
+            console.log(`⚠️ Test mode: Payment failed but keeping consultation ${failedConsultationId} booked`);
+            await updateOrderPaymentStatus(appConfig, failedConsultationId, 'pending', null);
+          } else {
+            await updateOrderPaymentStatus(appConfig, failedConsultationId, 'failed', null);
+          }
+          
+          // Send notifications about payment failure (using app config)
+          sendPaymentNotifications(appConfig, failedConsultationId, 'failed', failedPayment.amount, failedPayment.id).catch(err => {
+            console.error('Failed to send payment failure notifications:', err);
+          });
         }
         break;
 
