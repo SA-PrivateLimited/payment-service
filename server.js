@@ -25,8 +25,44 @@ require('dotenv').config();
 const express = require('express');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const admin = require('firebase-admin');
+const path = require('path');
 
 const app = express();
+
+// Initialize Firebase Admin SDK (optional - only if service account is provided)
+// Using Realtime Database instead of Firestore (no billing required)
+let database = null;
+if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH || process.env.FIREBASE_PROJECT_ID) {
+  try {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+      // Use service account key file
+      const serviceAccountPath = path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
+      const serviceAccount = require(serviceAccountPath);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: `https://${serviceAccount.project_id}-default-rtdb.firebaseio.com/`,
+      });
+    } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+      // Use individual credentials from environment variables
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: process.env.FIREBASE_PROJECT_ID,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        }),
+        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/`,
+      });
+    }
+    database = admin.database();
+    console.log('✅ Firebase Admin initialized successfully (Realtime Database)');
+  } catch (error) {
+    console.warn('⚠️  Firebase Admin initialization failed:', error.message);
+    console.warn('⚠️  Payment records will not be saved to Realtime Database. Continuing without Firebase...');
+  }
+} else {
+  console.log('ℹ️  Firebase Admin not configured. Payment records will not be saved to Realtime Database.');
+}
 
 // Middleware
 app.use(express.json());
@@ -63,6 +99,80 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+/**
+ * Helper function to save payment record to Realtime Database
+ */
+async function savePaymentToDatabase(paymentData) {
+  if (!database) {
+    return; // Firebase not configured, skip
+  }
+
+  try {
+    const paymentRecord = {
+      razorpayPaymentId: paymentData.razorpay_payment_id,
+      razorpayOrderId: paymentData.razorpay_order_id,
+      razorpaySignature: paymentData.razorpay_signature,
+      amount: paymentData.amount || null,
+      amountInRupees: paymentData.amount ? paymentData.amount / 100 : null,
+      status: 'completed',
+      verified: true,
+      consultationId: paymentData.consultationId || null,
+      notes: paymentData.notes || {},
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      verifiedAt: admin.database.ServerValue.TIMESTAMP,
+    };
+
+    // Save to payments node in Realtime Database
+    const paymentRef = database.ref('payments').push();
+    await paymentRef.set(paymentRecord);
+
+    // If consultationId exists, update consultation node
+    if (paymentData.consultationId) {
+      await database.ref(`consultations/${paymentData.consultationId}`).update({
+        paymentStatus: 'paid',
+        paymentId: paymentData.razorpay_payment_id,
+        paidAt: admin.database.ServerValue.TIMESTAMP,
+        updatedAt: admin.database.ServerValue.TIMESTAMP,
+      });
+    }
+
+    console.log(`✅ Payment record saved to Realtime Database: ${paymentData.razorpay_payment_id}`);
+  } catch (error) {
+    console.error('❌ Error saving payment to Realtime Database:', error);
+    // Don't throw - payment verification succeeded, database save is secondary
+  }
+}
+
+/**
+ * Helper function to save order record to Realtime Database
+ */
+async function saveOrderToDatabase(orderData, notes = {}) {
+  if (!database) {
+    return; // Firebase not configured, skip
+  }
+
+  try {
+    const orderRecord = {
+      razorpayOrderId: orderData.id,
+      amount: orderData.amount,
+      amountInRupees: orderData.amount / 100,
+      currency: orderData.currency,
+      receipt: orderData.receipt,
+      status: orderData.status,
+      consultationId: notes.consultationId || null,
+      notes: notes,
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+    };
+
+    const orderRef = database.ref('orders').push();
+    await orderRef.set(orderRecord);
+    console.log(`✅ Order record saved to Realtime Database: ${orderData.id}`);
+  } catch (error) {
+    console.error('❌ Error saving order to Realtime Database:', error);
+    // Don't throw - order creation succeeded, database save is secondary
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -134,6 +244,11 @@ app.post('/api/payment/create-order', async (req, res) => {
 
     console.log(`✅ Order created: ${order.id} for amount: ₹${amount / 100}`);
 
+    // Save order to Realtime Database (async, don't wait)
+    saveOrderToDatabase(order, notes).catch(err => {
+      console.error('Failed to save order to Realtime Database:', err);
+    });
+
     res.json({
       success: true,
       order: {
@@ -161,10 +276,13 @@ app.post('/api/payment/create-order', async (req, res) => {
  * Body: {
  *   razorpay_order_id: 'order_id',
  *   razorpay_payment_id: 'payment_id',
- *   razorpay_signature: 'signature'
+ *   razorpay_signature: 'signature',
+ *   consultationId: 'consultation_id' (optional),
+ *   amount: 50000 (optional - amount in paise),
+ *   notes: {} (optional)
  * }
  */
-app.post('/api/payment/verify', (req, res) => {
+app.post('/api/payment/verify', async (req, res) => {
   try {
     const {
       razorpay_order_id,
@@ -191,6 +309,20 @@ app.post('/api/payment/verify', (req, res) => {
 
     if (isSignatureValid) {
       console.log(`✅ Payment verified successfully: ${razorpay_payment_id}`);
+
+      // Save payment record to Realtime Database (async, don't wait)
+      const paymentData = {
+        razorpay_payment_id: razorpay_payment_id,
+        razorpay_order_id: razorpay_order_id,
+        razorpay_signature: razorpay_signature,
+        amount: req.body.amount || null,
+        consultationId: req.body.consultationId || null,
+        notes: req.body.notes || {},
+      };
+      savePaymentToDatabase(paymentData).catch(err => {
+        console.error('Failed to save payment to Realtime Database:', err);
+      });
+
       res.json({
         success: true,
         message: 'Payment verified successfully',
@@ -366,7 +498,7 @@ app.post('/api/payment/generate-upi-link', async (req, res) => {
  * URL: https://your-server.com/api/payment/webhook
  * Events: payment.captured, payment.failed, order.paid
  */
-app.post('/api/payment/webhook', express.raw({type: 'application/json'}), (req, res) => {
+app.post('/api/payment/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   try {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
     
@@ -401,20 +533,67 @@ app.post('/api/payment/webhook', express.raw({type: 'application/json'}), (req, 
       case 'payment.captured':
         const payment = event.payload.payment.entity;
         console.log(`✅ Payment captured: ${payment.id}, Amount: ₹${payment.amount / 100}`);
-        // TODO: Update payment status in your database
-        // Call your database update function here
+        
+        // Save payment to Realtime Database
+        if (database) {
+          const paymentData = {
+            razorpay_payment_id: payment.id,
+            razorpay_order_id: payment.order_id,
+            amount: payment.amount,
+            status: 'completed',
+            method: payment.method,
+            notes: payment.notes || {},
+          };
+          savePaymentToDatabase(paymentData).catch(err => {
+            console.error('Failed to save webhook payment to Realtime Database:', err);
+          });
+        }
         break;
 
       case 'payment.failed':
         const failedPayment = event.payload.payment.entity;
         console.log(`❌ Payment failed: ${failedPayment.id}`);
-        // TODO: Handle failed payment in your database
+        
+        // Save failed payment to Realtime Database
+        if (database) {
+          try {
+            const failedPaymentRef = database.ref('payments').push();
+            await failedPaymentRef.set({
+              razorpayPaymentId: failedPayment.id,
+              razorpayOrderId: failedPayment.order_id,
+              amount: failedPayment.amount,
+              amountInRupees: failedPayment.amount / 100,
+              status: 'failed',
+              errorCode: failedPayment.error_code,
+              errorDescription: failedPayment.error_description,
+              createdAt: admin.database.ServerValue.TIMESTAMP,
+            });
+          } catch (error) {
+            console.error('Failed to save failed payment to Realtime Database:', error);
+          }
+        }
         break;
 
       case 'order.paid':
         const order = event.payload.order.entity;
         console.log(`✅ Order paid: ${order.id}`);
-        // TODO: Update order status in your database
+        
+        // Update order status in Realtime Database
+        if (database) {
+          try {
+            const ordersSnapshot = await database.ref('orders').orderByChild('razorpayOrderId').equalTo(order.id).once('value');
+            
+            if (ordersSnapshot.exists()) {
+              const orderKey = Object.keys(ordersSnapshot.val())[0];
+              await database.ref(`orders/${orderKey}`).update({
+                status: 'paid',
+                paidAt: admin.database.ServerValue.TIMESTAMP,
+              });
+            }
+          } catch (error) {
+            console.error('Failed to update order in Realtime Database:', error);
+          }
+        }
         break;
 
       default:
@@ -456,6 +635,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Payment server running on port ${PORT}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔑 Razorpay Key ID: ${process.env.RAZORPAY_KEY_ID ? '✅ Configured' : '❌ NOT CONFIGURED'}`);
+  console.log(`🔥 Firebase Admin: ${database ? '✅ Connected (Realtime Database)' : '⚠️  Not configured (payment records will not be saved)'}`);
   console.log(`📱 QR Code Mode: ${DEFAULT_QR_CODE_ID ? `Using existing: ${DEFAULT_QR_CODE_ID}` : '✅ Dynamic (creating new QR codes per payment)'}`);
   console.log(`🌐 Allowed Origins: ${process.env.ALLOWED_ORIGINS || 'All (*)'}`);
   console.log(`\n📚 API Endpoints:`);

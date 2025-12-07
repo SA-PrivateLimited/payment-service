@@ -1,0 +1,17 @@
+{
+  "rules": {
+    "orders": {
+      ".read": "auth != null",
+      ".write": false
+    },
+    "payments": {
+      ".read": "auth != null",
+      ".write": false
+    },
+    "consultations": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    }
+  }
+}
+
